@@ -1,4 +1,5 @@
 import Cocoa
+import ApplicationServices
 
 class EventTapManager {
     fileprivate var eventTap: CFMachPort?
@@ -9,6 +10,13 @@ class EventTapManager {
     var onCutBufferChanged: ((Int) -> Void)?
 
     func start() {
+        // Prompt for Accessibility permission if not granted
+        if !AXIsProcessTrusted() {
+            NSLog("CutPaste: Accessibility chưa được cấp, hiển thị dialog hệ thống")
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+        }
+
         let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
 
         guard let tap = CGEvent.tapCreate(
@@ -69,13 +77,16 @@ class EventTapManager {
 
         switch keyCode {
         case 7: // X key - Cut
-            handleCut()
-            return nil // Swallow the event
+            // Return IMMEDIATELY — AppleScript runs async in background
+            // Cmd+X has no default behavior in Finder, safe to always swallow
+            handleCutAsync()
+            return nil
 
         case 9: // V key - Paste
             if !cutBuffer.isEmpty {
-                handlePaste()
-                return nil // Swallow the event
+                // Return IMMEDIATELY — file move runs async in background
+                handlePasteAsync()
+                return nil
             }
             return event // No files in buffer, let normal paste through
 
@@ -90,34 +101,40 @@ class EventTapManager {
         }
     }
 
-    private func handleCut() {
-        let files = FinderBridge.getSelectedFiles()
-        guard !files.isEmpty else {
-            NSLog("CutPaste: Không có file nào được chọn")
-            return
+    private func handleCutAsync() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let files = FinderBridge.getSelectedFiles()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if files.isEmpty {
+                    NSLog("CutPaste: Không có file nào được chọn")
+                    return
+                }
+                self.cutBuffer = files
+                self.onCutBufferChanged?(self.cutBuffer.count)
+                NSLog("CutPaste: Đã cut \(files.count) file")
+            }
         }
-
-        cutBuffer = files
-        onCutBufferChanged?(cutBuffer.count)
-        NSLog("CutPaste: Đã cut \(files.count) file")
     }
 
-    private func handlePaste() {
-        guard let destination = FinderBridge.getCurrentFolder() else {
-            NSLog("CutPaste: Không thể xác định thư mục đích")
-            showNotification(title: "CutPaste", message: "Không thể xác định thư mục đích")
-            return
-        }
-
+    private func handlePasteAsync() {
         let filesToMove = cutBuffer
-        clearCutBuffer()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let destination = FinderBridge.getCurrentFolder() else {
+                NSLog("CutPaste: Không thể xác định thư mục đích")
+                DispatchQueue.main.async {
+                    self?.showNotification(title: "CutPaste", message: "Không thể xác định thư mục đích")
+                }
+                return
+            }
+
             let result = self?.fileMover.moveFiles(filesToMove, to: destination)
 
             DispatchQueue.main.async {
                 switch result {
                 case .success(let count):
+                    self?.clearCutBuffer()
                     NSLog("CutPaste: Đã di chuyển \(count) file đến \(destination)")
                 case .failure(let error):
                     NSLog("CutPaste: Lỗi di chuyển file: \(error)")
@@ -131,6 +148,7 @@ class EventTapManager {
 
     private func showAccessibilityAlert() {
         DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
             let alert = NSAlert()
             alert.messageText = "CutPaste cần quyền Accessibility"
             alert.informativeText = "Vui lòng vào System Settings → Privacy & Security → Accessibility và bật CutPaste."
@@ -146,11 +164,14 @@ class EventTapManager {
     }
 
     private func showNotification(title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .informational
-        alert.runModal()
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = message
+            alert.alertStyle = .informational
+            alert.runModal()
+        }
     }
 }
 
@@ -168,17 +189,17 @@ private func eventTapCallback(
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
         }
-        return Unmanaged.passRetained(event)
+        return Unmanaged.passUnretained(event)
     }
 
     guard type == .keyDown, let userInfo = userInfo else {
-        return Unmanaged.passRetained(event)
+        return Unmanaged.passUnretained(event)
     }
 
     let manager = Unmanaged<EventTapManager>.fromOpaque(userInfo).takeUnretainedValue()
 
     if let modifiedEvent = manager.handleKeyEvent(event) {
-        return Unmanaged.passRetained(modifiedEvent)
+        return Unmanaged.passUnretained(modifiedEvent)
     }
 
     return nil // Swallow the event

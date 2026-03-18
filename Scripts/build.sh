@@ -60,6 +60,9 @@ cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
 # Remove standalone binary
 rm "$BUILD_DIR/$APP_NAME"
 
+echo "Signing app bundle..."
+codesign --force --deep --sign - "$APP_BUNDLE"
+
 echo "App bundle created at: $APP_BUNDLE"
 
 # Create DMG installer

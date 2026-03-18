@@ -24,5 +24,7 @@
     <string>AppIcon</string>
     <key>NSAccessibilityUsageDescription</key>
     <string>CutPaste cần quyền Accessibility để chặn phím tắt Command+X/V trong Finder và thực hiện cut/paste file.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>CutPaste cần quyền Automation để lấy danh sách file đang chọn và thư mục hiện tại trong Finder.</string>
 </dict>
 </plist>
