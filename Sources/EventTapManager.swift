@@ -4,19 +4,50 @@ import ApplicationServices
 class EventTapManager {
     fileprivate var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var cutBuffer: [String] = []
+
+    // Protect cutBuffer with a dedicated serial queue to avoid data races
+    private let bufferQueue = DispatchQueue(label: "com.cutpaste.bufferQueue")
+    private var _cutBuffer: [String] = []
+    private var cutBuffer: [String] {
+        get { bufferQueue.sync { _cutBuffer } }
+        set { bufferQueue.sync { _cutBuffer = newValue } }
+    }
+
     private let fileMover = FileMover()
 
     var onCutBufferChanged: ((Int) -> Void)?
 
+    private var permissionTimer: Timer?
+
     func start() {
-        // Prompt for Accessibility permission if not granted
+        // Only Accessibility is required for cgSessionEventTap.
+        // Do NOT call CGPreflightListenEventAccess / CGRequestListenEventAccess —
+        // those are for a different permission and cause false-negatives on macOS 14+.
         if !AXIsProcessTrusted() {
             NSLog("CutPaste: Accessibility chưa được cấp, hiển thị dialog hệ thống")
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
             AXIsProcessTrustedWithOptions(options)
+            startPermissionPolling()
+            return
         }
 
+        createEventTap()
+    }
+
+    private func startPermissionPolling() {
+        permissionTimer?.invalidate()
+        NSLog("CutPaste: Bắt đầu polling quyền Accessibility...")
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+            if AXIsProcessTrusted() {
+                NSLog("CutPaste: Quyền Accessibility đã được cấp!")
+                timer.invalidate()
+                self?.permissionTimer = nil
+                self?.createEventTap()
+            }
+        }
+    }
+
+    private func createEventTap() {
         let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
 
         guard let tap = CGEvent.tapCreate(
@@ -27,8 +58,8 @@ class EventTapManager {
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            NSLog("CutPaste: Không thể tạo event tap. Hãy cấp quyền Accessibility trong System Settings.")
-            showAccessibilityAlert()
+            NSLog("CutPaste: Không thể tạo event tap dù đã có quyền Accessibility")
+            showPermissionsAlert(missingAccessibility: false, missingInputMonitoring: false)
             return
         }
 
@@ -38,9 +69,12 @@ class EventTapManager {
         CGEvent.tapEnable(tap: tap, enable: true)
 
         NSLog("CutPaste: Event tap đã khởi động thành công")
+        FinderBridge.preflightAutomation()
     }
 
     func stop() {
+        permissionTimer?.invalidate()
+        permissionTimer = nil
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
@@ -52,7 +86,7 @@ class EventTapManager {
     }
 
     func clearCutBuffer() {
-        cutBuffer.removeAll()
+        cutBuffer = []
         onCutBufferChanged?(0)
         NSLog("CutPaste: Cut buffer đã được xóa")
     }
@@ -77,24 +111,21 @@ class EventTapManager {
 
         switch keyCode {
         case 7: // X key - Cut
-            // Return IMMEDIATELY — AppleScript runs async in background
-            // Cmd+X has no default behavior in Finder, safe to always swallow
             handleCutAsync()
             return nil
 
         case 9: // V key - Paste
             if !cutBuffer.isEmpty {
-                // Return IMMEDIATELY — file move runs async in background
                 handlePasteAsync()
                 return nil
             }
-            return event // No files in buffer, let normal paste through
+            return event
 
-        case 8: // C key - Copy (clear cut buffer if user switches to copy)
+        case 8: // C key - Copy (clear cut buffer)
             if !cutBuffer.isEmpty {
                 clearCutBuffer()
             }
-            return event // Let normal copy through
+            return event
 
         default:
             return event
@@ -102,63 +133,71 @@ class EventTapManager {
     }
 
     private func handleCutAsync() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // AppleScript MUST run on main thread for reliable permission prompts
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
             let files = FinderBridge.getSelectedFiles()
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if files.isEmpty {
-                    NSLog("CutPaste: Không có file nào được chọn")
-                    return
-                }
-                self.cutBuffer = files
-                self.onCutBufferChanged?(self.cutBuffer.count)
-                NSLog("CutPaste: Đã cut \(files.count) file")
+            guard !files.isEmpty else {
+                NSLog("CutPaste: Không có file nào được chọn")
+                return
             }
+            self.cutBuffer = files
+            self.onCutBufferChanged?(files.count)
+            NSLog("CutPaste: Đã cut \(files.count) file(s)")
         }
     }
 
     private func handlePasteAsync() {
-        let filesToMove = cutBuffer
+        // Read buffer safely on main thread, then do the actual work on a background queue
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Capture buffer snapshot on main thread to avoid race with clearCutBuffer
+            let filesToMove = self.cutBuffer
+            guard !filesToMove.isEmpty else { return }
+
             guard let destination = FinderBridge.getCurrentFolder() else {
                 NSLog("CutPaste: Không thể xác định thư mục đích")
-                DispatchQueue.main.async {
-                    self?.showNotification(title: "CutPaste", message: "Không thể xác định thư mục đích")
-                }
+                self.showNotification(title: "CutPaste", message: "Không thể xác định thư mục đích")
                 return
             }
 
-            let result = self?.fileMover.moveFiles(filesToMove, to: destination)
-
-            DispatchQueue.main.async {
-                switch result {
-                case .success(let count):
-                    self?.clearCutBuffer()
-                    NSLog("CutPaste: Đã di chuyển \(count) file đến \(destination)")
-                case .failure(let error):
-                    NSLog("CutPaste: Lỗi di chuyển file: \(error)")
-                    self?.showNotification(title: "CutPaste - Lỗi", message: error.localizedDescription)
-                case .none:
-                    break
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                let result = self.fileMover.moveFiles(filesToMove, to: destination)
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let count):
+                        self.clearCutBuffer()
+                        NSLog("CutPaste: Đã di chuyển \(count) file(s) đến \(destination)")
+                    case .failure(let error):
+                        NSLog("CutPaste: Lỗi di chuyển file: \(error)")
+                        self.showNotification(title: "CutPaste - Lỗi", message: error.localizedDescription)
+                    }
                 }
             }
         }
     }
 
-    private func showAccessibilityAlert() {
+    private func showPermissionsAlert(missingAccessibility: Bool, missingInputMonitoring: Bool) {
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             let alert = NSAlert()
             alert.messageText = "CutPaste cần quyền Accessibility"
-            alert.informativeText = "Vui lòng vào System Settings → Privacy & Security → Accessibility và bật CutPaste."
+            alert.informativeText = """
+Vui lòng vào System Settings → Privacy & Security → Accessibility,
+thêm CutPaste và bật toggle.
+
+Sau khi bật, hãy thoát CutPaste và mở lại.
+"""
             alert.alertStyle = .warning
-            alert.addButton(withTitle: "Mở System Settings")
+            alert.addButton(withTitle: "Mở Accessibility")
             alert.addButton(withTitle: "Đóng")
 
             if alert.runModal() == .alertFirstButtonReturn {
-                let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-                NSWorkspace.shared.open(url)
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                    NSWorkspace.shared.open(url)
+                }
             }
         }
     }
@@ -181,22 +220,23 @@ private func eventTapCallback(
     event: CGEvent,
     userInfo: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
-    // Re-enable tap if it gets disabled by the system
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let userInfo = userInfo {
-            let manager = Unmanaged<EventTapManager>.fromOpaque(userInfo).takeUnretainedValue()
-            if let tap = manager.eventTap {
-                CGEvent.tapEnable(tap: tap, enable: true)
-            }
-        }
-        return Unmanaged.passUnretained(event)
-    }
-
-    guard type == .keyDown, let userInfo = userInfo else {
+    guard let userInfo = userInfo else {
         return Unmanaged.passUnretained(event)
     }
 
     let manager = Unmanaged<EventTapManager>.fromOpaque(userInfo).takeUnretainedValue()
+
+    // Re-enable tap if the system disables it
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        if let tap = manager.eventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    guard type == .keyDown else {
+        return Unmanaged.passUnretained(event)
+    }
 
     if let modifiedEvent = manager.handleKeyEvent(event) {
         return Unmanaged.passUnretained(modifiedEvent)

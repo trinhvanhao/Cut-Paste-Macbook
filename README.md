@@ -39,6 +39,17 @@ App cần quyền Accessibility để hoạt động:
 2. Nhấn **+**, thêm **CutPaste**
 3. Bật toggle
 
+### Nếu vẫn chưa hoạt động
+
+Trên một số phiên bản macOS, bạn cần bật thêm:
+
+- **Privacy & Security → Input Monitoring** (CutPaste)
+- **Privacy & Security → Automation** → cho phép **CutPaste** điều khiển **Finder**
+
+Sau khi bật quyền, hãy **Thoát CutPaste và mở lại**.
+
+Nếu bạn **build lại** hoặc **di chuyển app sang đường dẫn khác**, macOS có thể yêu cầu cấp quyền lại. Khi đó hãy tắt/bật lại CutPaste trong các mục quyền ở trên.
+
 ## Yêu cầu hệ thống
 
 - macOS 13.0 (Ventura) trở lên

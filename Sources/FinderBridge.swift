@@ -1,10 +1,19 @@
 import Cocoa
 
 struct FinderBridge {
+    private static var didShowAutomationAlert = false
 
     static func isFinderActive() -> Bool {
         guard let app = NSWorkspace.shared.frontmostApplication else { return false }
         return app.bundleIdentifier == "com.apple.finder"
+    }
+
+    static func preflightAutomation() {
+        // Trigger the Automation prompt early (CutPaste → Finder) so hotkeys "just work".
+        // Run on a background thread to avoid blocking the main run loop at startup.
+        DispatchQueue.global(qos: .utility).async {
+            _ = runAppleScript(#"tell application "Finder" to get name of startup disk"#)
+        }
     }
 
     static func getSelectedFiles() -> [String] {
@@ -43,6 +52,7 @@ struct FinderBridge {
 
         if let error = error {
             NSLog("CutPaste AppleScript error: \(error)")
+            maybeShowAutomationAlertIfNeeded(error)
             return []
         }
 
@@ -63,5 +73,34 @@ struct FinderBridge {
         }
 
         return []
+    }
+
+    private static func maybeShowAutomationAlertIfNeeded(_ error: NSDictionary) {
+        guard !didShowAutomationAlert else { return }
+
+        // -1743 is a common "Not authorized to send Apple events to ..." error.
+        if let number = error["NSAppleScriptErrorNumber"] as? Int, number == -1743 || number == -1744 {
+            didShowAutomationAlert = true
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.messageText = "CutPaste cần quyền Automation để điều khiển Finder"
+                alert.informativeText = """
+Vui lòng vào System Settings → Privacy & Security → Automation,
+sau đó bật quyền cho CutPaste điều khiển Finder.
+
+Sau khi bật, hãy thoát CutPaste và mở lại.
+"""
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Mở Automation")
+                alert.addButton(withTitle: "Đóng")
+
+                if alert.runModal() == .alertFirstButtonReturn {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+        }
     }
 }
